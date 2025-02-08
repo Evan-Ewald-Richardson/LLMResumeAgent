@@ -1,4 +1,4 @@
-from typing import List, Dict, Optional
+from typing import List, Dict
 from dataclasses import dataclass
 from pydantic import BaseModel
 import ollama
@@ -7,69 +7,59 @@ MODEL_NAME = "mistral:latest"
 
 @dataclass
 class QuestionAnalysis:
-    """Structured analysis of user questions"""
+    """Structured analysis of resume-related questions"""
     original_question: str
-    topics: List[str] = None
-    required_context_types: List[str] = None
+    focus_area: str  # 'projects', 'work_experience', 'education', 'skills'
+    skills_mentioned: List[str] = None
 
 class ChatRequest(BaseModel):
     question: str
 
 class ContextProcessor:
-    """Processes the question to extract main topics and relevant context types."""
+    """Processes resume-related questions to determine focus area and extract relevant skills."""
     
     @staticmethod
     async def analyze_question(question: str) -> QuestionAnalysis:
         analysis_prompt = f"""
-        Analyze this question and break it down into key components:
+        Analyze this resume-related question and determine its focus:
         Question: {question}
         
-        1. Identify the main topics (at least 2-3 related terms).
-        2. Specify what types of context would be most relevant.
-        
-        Please output your answer in plain text using the following format:
-        
-        Topics: topic1, topic2, topic3.
-        Context Types: type1, type2.
+        Output your answer in this format:
+        Focus Area: [One of: projects, work_experience, education, skills]
+        Skills Mentioned: [Any technical skills, languages, or tools mentioned in the question - if none are mentioned leave blank]
         """
         
         try:
             response = ollama.chat(
                 model=MODEL_NAME,
-                messages=[{"content": analysis_prompt}],
+                messages=[{"role": "user", "content": analysis_prompt}],
                 stream=False
             )
+
             response_text = response["message"]["content"]
             
-            # Parse the plain text output to extract topics and context types.
-            topics = []
-            context_types = []
+            # Parse the response
+            focus_area = "general"
+            skills = []
+            
             for line in response_text.splitlines():
                 line = line.strip()
-                if line.lower().startswith("topics:"):
-                    topics = [item.strip() for item in line[len("Topics:"):].split(",") if item.strip()]
-                elif line.lower().startswith("context types:"):
-                    context_types = [item.strip() for item in line[len("Context Types:"):].split(",") if item.strip()]
+                if line.startswith("Focus Area:"):
+                    focus_area = line[len("Focus Area:"):].strip().lower()
+                elif line.startswith("Skills Mentioned:"):
+                    skills = [skill.strip() for skill in line[len("Skills Mentioned:"):].split(",") if skill.strip()]
             
-            # Fallback: if no topics were parsed, split the original question into words.
-            if not topics:
-                topics = [word.strip() for word in question.lower().split() if len(word.strip()) > 3]
-            # Ensure the original question is included as a topic.
-            if question not in topics:
-                topics.append(question)
-            
-            analysis = QuestionAnalysis(
+            return QuestionAnalysis(
                 original_question=question,
-                topics=topics,
-                required_context_types=context_types
+                focus_area=focus_area,
+                skills_mentioned=skills
             )
-            return analysis
             
         except Exception as e:
             print(f"Error in analyze_question: {str(e)}")
             return QuestionAnalysis(
                 original_question=question,
-                topics=[question]
+                focus_area="general"
             )
     
     @staticmethod
@@ -77,40 +67,46 @@ class ContextProcessor:
         analysis: QuestionAnalysis,
         vector_store
     ) -> List[Dict]:
-        """Retrieve and organize relevant context from the vector store."""
+        """Retrieve relevant experience and skills from the vector store."""
         contexts = []
-        for topic in analysis.topics:
-            # Only filter by category if context types are provided.
-            filter_criteria = {"category": {"$in": analysis.required_context_types}} if analysis.required_context_types else None
-            retrieved_docs = vector_store.similarity_search(
-                topic,
-                k=2,
-                filter=filter_criteria
-            )
-            for doc in retrieved_docs:
-                contexts.append({
+        
+        # First, search based on focus area
+        focus_query = analysis.original_question
+        if analysis.focus_area != "general":
+            focus_query = f"{analysis.focus_area} {analysis.original_question}"
+        
+        retrieved_docs = vector_store.similarity_search(
+            focus_query,
+            k=2
+        )
+        contexts.extend([{
+            "content": doc.page_content,
+            "source": doc.metadata.get("source", "Unknown")
+        } for doc in retrieved_docs])
+        
+        # If skills were mentioned, do an additional search
+        if analysis.skills_mentioned:
+            for skill in analysis.skills_mentioned:
+                skill_docs = vector_store.similarity_search(
+                    f"{skill} experience examples",
+                    k=1
+                )
+                contexts.extend([{
                     "content": doc.page_content,
-                    "metadata": doc.metadata
-                })
+                    "source": doc.metadata.get("source", "Unknown")
+                } for doc in skill_docs])
+        
         return contexts
 
-
 class ResponseGenerator:
-    """Generates and formats responses based on the analysis and retrieved context."""
+    """Generates focused responses about resume experience."""
     
     @staticmethod
     def format_context(contexts: List[Dict]) -> str:
-        formatted_contexts = []
-        for ctx in contexts:
-            formatted_contexts.append(
-                f"""
-                Source: {ctx['metadata']['category']}/{ctx['metadata'].get('subcategory', 'N/A')}
-                Confidence: {ctx['metadata']['confidence']}
-                ---
-                {ctx['content']}
-                """
-            )
-        return "\n\n=== Context Separator ===\n\n".join(formatted_contexts)
+        return "\n\n---\n\n".join([
+            ctx['content']
+            for ctx in contexts
+        ])
     
     @staticmethod
     def generate_prompt(
@@ -119,22 +115,23 @@ class ResponseGenerator:
         analysis: QuestionAnalysis
     ) -> str:
         return f"""
-        You are an assistant specialized in Evan's work and project experience.
-        
-        Guidelines:
-        1. Use ONLY the provided context for your response
-        2. Maintain high accuracy and acknowledge information gaps
-        3. Consider temporal context: {analysis.temporal_context or 'No specific time period'}
-        4. Cite specific experiences and projects when relevant
+        You are an assistant helping to answer questions about Evan's professional experience.
         
         Context Information:
         {context}
         
         Question: {question}
+        Focus Area: {analysis.focus_area}
+        {f'Relevant Skills: {", ".join(analysis.skills_mentioned)}' if analysis.skills_mentioned else ''}
         
-        Response Requirements:
-        1. Start with a direct answer to the question
-        2. Reference specific examples from the context
-        3. Maintain professional tone
-        4. Clearly state if any part of the question cannot be answered with the given context
+        Please provide a clear, concise, and focused response that:
+        1. Directly answers the question using only the provided context
+        2. Highlights specific examples and experiences
+        3. If technical skills are mentioned, includes concrete examples of their use
+        4. Does not reference gaps in information or context
+        5. Speaks in a 3rd person voice: Evan worked...
+        6. Speaks in absolutes, no likely or might, etc.
+
+        If the question is unrelated to Evan's projects, work experience, education, or skills,
+        answer it directly without referencing the context. Avoid providing unnecessary or unrelated information.
         """

@@ -3,15 +3,18 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 
-from document_loader import VectorStoreManager
+from document_loader import ResumeDocumentProcessor  # Updated to correct class
 from chat_logic import ChatRequest, ContextProcessor, ResponseGenerator
 
 import ollama
+import os
 
 app = FastAPI()
-vector_store_manager = VectorStoreManager()
 
-# Enable CORS for all origins (adjust as needed)
+# Initialize resume processor
+resume_processor = ResumeDocumentProcessor()
+
+# Enable CORS for frontend requests (adjust as needed)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -23,9 +26,11 @@ app.add_middleware(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown events."""
-    await vector_store_manager.initialize()
+    print("Initializing vector store...")
+    processed_docs_count = await resume_processor.initialize_vector_store(docs_folder="docs")
+    print(f"Loaded {processed_docs_count} documents into vector store.")
     yield
-    # Add any necessary cleanup code here
+    print("Shutting down server...")
 
 app.router.lifespan_context = lifespan
 
@@ -34,78 +39,68 @@ async def root():
     """Health check endpoint."""
     return {
         "status": "operational",
-        "vector_store": "ready" if vector_store_manager.vector_store else "not_ready"
+        "vector_store": "ready" if resume_processor.vector_store else "not_ready"
     }
 
 @app.post("/chat")
 async def chat(request: ChatRequest):
     """Retrieves relevant context and generates an answer using Ollama."""
-    if vector_store_manager.vector_store is None:
-        return {"response": "Vector store not loaded yet. Please try again in a moment."}
+    if resume_processor.vector_store is None:
+        raise HTTPException(status_code=503, detail="Vector store not loaded yet. Please try again later.")
     
     try:
-        # Stage 1: Analyze the question
+        # 🔹 Step 1: Analyze the question
         analysis = await ContextProcessor.analyze_question(request.question)
+        print("\n Question Analysis Summary:")
+        print(analysis.__dict__)  # Debug print analysis
+
+        # 🔹 Step 2: Retrieve relevant experience and context
+        relevant_contexts = await ContextProcessor.get_relevant_context(analysis, resume_processor.vector_store)
         
-        # Stage 2: Retrieve context using similarity search (with fallback filtering)
-        retrieved_docs = []
-        for topic in analysis.topics:
-            if analysis.required_context_types:
-                docs = vector_store_manager.vector_store.similarity_search(
-                    topic,
-                    k=3,
-                    filter={"confidence": {"$gte": analysis.confidence_threshold}}
-                    if analysis.confidence_threshold else None
-                )
-                retrieved_docs.extend(docs)
-        
-        if not retrieved_docs:
-            for topic in analysis.topics:
-                docs = vector_store_manager.vector_store.similarity_search(topic, k=3, filter=None)
-                retrieved_docs.extend(docs)
-        
-        # Deduplicate documents based on content
-        seen_content = set()
-        unique_docs = []
-        for doc in retrieved_docs:
-            if doc.page_content not in seen_content:
-                seen_content.add(doc.page_content)
-                unique_docs.append(doc)
-        
-        if not unique_docs:
+        if not relevant_contexts:
+            print("\n No relevant contexts found.")
             return {
-                "response": "I apologize, but I don't have enough context to properly answer your question. Could you please rephrase or provide more details?",
+                "response": "I don't have enough context to properly answer your question. Please provide more details or rephrase.",
                 "debug_info": {
                     "analysis": analysis.__dict__,
                     "context_count": 0
-                } if request.include_debug_info else None
+                }
             }
         
-        # Stage 3: Format the retrieved context and generate the prompt
-        formatted_context = ResponseGenerator.format_context(
-            [{"content": doc.page_content, "metadata": doc.metadata} for doc in unique_docs]
-        )
+        # Print retrieved context chunks
+        print("\n Retrieved Context Chunks:")
+        for idx, context in enumerate(relevant_contexts):
+            print(f"\n🔹 Chunk {idx+1}:")
+            print(f"Source: {context['source']}")
+            print(f"Content: {context['content'][:500]}...")  # Print first 500 chars for readability
+
+        # 🔹 Step 3: Format retrieved context and generate a response
+        formatted_context = ResponseGenerator.format_context(relevant_contexts)
         prompt = ResponseGenerator.generate_prompt(request.question, formatted_context, analysis)
-        
-        # Stage 4: Get the response from Ollama
+
+        # Print final prompt before sending to Ollama
+        print("\n Final Generated Prompt:")
+        print(prompt)
+
+        # 🔹 Step 4: Generate response using Ollama
         response = ollama.chat(
             model="mistral:latest",
             messages=[{"role": "user", "content": prompt}],
             stream=False
         )
-        
+
         return {
             "response": response["message"]["content"],
             "debug_info": {
                 "analysis": analysis.__dict__,
-                "context_count": len(unique_docs),
-                "topics": analysis.topics,
-                "required_context_types": analysis.required_context_types
-            } if request.include_debug_info else None
+                "context_count": len(relevant_contexts),
+                "focus_area": analysis.focus_area,
+                "skills_mentioned": analysis.skills_mentioned
+            }
         }
         
     except Exception as e:
-        print(f"Error in chat endpoint: {str(e)}")
+        print(f"\n Error in chat endpoint: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
