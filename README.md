@@ -1,0 +1,5 @@
+# Modal RAG Chatbot with TensorRT-LLM and Llama 3
+
+This project implements a Retrieval-Augmented Generation (RAG) chatbot using [Modal](https://modal.com/), [NVIDIA TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM), and the `NousResearch/Meta-Llama-3-8B-Instruct` model. It provides accelerated inference via TensorRT-LLM and answers user questions based on information retrieved from a local knowledge base built from text/markdown files.
+
+The Modal application defines a container image that automates several steps: downloading the base Llama 3 model, quantizing it to FP8 precision, building an optimized TensorRT-LLM engine, and processing documents from a local `./content` directory. Document processing involves chunking large files, generating embeddings using Sentence Transformers (`all-MiniLM-L6-v2`), and creating a FAISS index. At runtime, the application loads the engine and RAG components, retrieves relevant context for user queries, constructs a prompt using this context, and generates responses using the fast TensorRT-LLM engine via a FastAPI endpoint.
